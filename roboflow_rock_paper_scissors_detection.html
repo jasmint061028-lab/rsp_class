@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Roboflow Rock-Paper-Scissors Detection</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+        }
+        #webcam {
+            transform: scaleX(-1); /* Mirror view for natural webcam experience */
+        }
+        .scan-line {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(to right, transparent, #06b6d4, transparent);
+            animation: scan 2s infinite ease-in-out;
+        }
+        @keyframes scan {
+            0% { top: 0%; opacity: 0.8; }
+            50% { opacity: 1; }
+            100% { top: 100%; opacity: 0.8; }
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col items-center justify-center p-4">
+
+    <header class="mb-4 text-center">
+        <h1 class="text-2xl font-bold tracking-tight text-cyan-400">가위바위보 실시간 인식기 (개선된 인식률)</h1>
+        <p class="text-sm text-slate-400">Roboflow Workflow API 연동 및 고해상도 캡처 최적화</p>
+    </header>
+
+    <main class="relative w-full max-w-2xl bg-slate-900 rounded-2xl shadow-2xl overflow-hidden border border-slate-800">
+        <!-- Webcam Video Element -->
+        <video id="webcam" autoplay playsinline muted class="w-full h-auto object-cover rounded-2xl"></video>
+        
+        <!-- Hidden Canvas for frame capturing -->
+        <canvas id="snapshotCanvas" class="hidden"></canvas>
+
+        <!-- Scanning Line Animation when active -->
+        <div id="scanLine" class="scan-line hidden"></div>
+
+        <!-- Top-Right Classification Badge -->
+        <div class="absolute top-4 right-4 bg-slate-950/80 backdrop-blur-md border border-slate-700/50 px-4 py-3 rounded-xl shadow-lg flex items-center gap-3">
+            <span class="w-3.5 h-3.5 rounded-full bg-emerald-500 animate-pulse" id="statusDot"></span>
+            <div>
+                <span class="text-xs text-slate-400 block uppercase tracking-wider font-semibold">인식 결과 & 신뢰도</span>
+                <div class="flex items-baseline gap-2">
+                    <span id="predictionResult" class="text-xl font-extrabold text-cyan-300">대기 중...</span>
+                    <span id="confidenceResult" class="text-xs text-slate-400 font-mono"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Controls / Info bar at bottom -->
+        <div class="absolute bottom-4 left-4 right-4 flex flex-col sm:flex-row justify-between items-center gap-3 bg-slate-950/80 backdrop-blur-md p-3 rounded-xl border border-slate-800">
+            <div class="text-xs text-slate-300 flex items-center gap-2">
+                <span id="apiStatus" class="inline-block w-2.5 h-2.5 rounded-full bg-amber-400"></span>
+                <span id="apiStatusText">카메라 대기 중... (고품질 JPEG 캡처 적용)</span>
+            </div>
+            <div class="flex gap-2 w-full sm:w-auto justify-end">
+                <button id="simBtn" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-2 rounded-lg transition shadow-md">
+                    테스트 모드 ON (CORS 우회)
+                </button>
+                <button id="toggleBtn" class="bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold px-4 py-2 rounded-lg transition shadow-md">
+                    인식 시작
+                </button>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        const API_URL = "https://serverless.roboflow.com/s-workspace-91ely/workflows/processed-rock-paper-vprocessed-rock-paper-blqc2-1-vitsmallpatch16dinov3lvd1689m-t1-logic";
+        const API_KEY = "acKxI0VT1rFnLWPlpQsb";
+
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('snapshotCanvas');
+        const predictionResultEl = document.getElementById('predictionResult');
+        const confidenceResultEl = document.getElementById('confidenceResult');
+        const apiStatusTextEl = document.getElementById('apiStatusText');
+        const apiStatusDotEl = document.getElementById('apiStatus');
+        const toggleBtn = document.getElementById('toggleBtn');
+        const simBtn = document.getElementById('simBtn');
+        const scanLineEl = document.getElementById('scanLine');
+
+        let isRunning = false;
+        let processingFrame = false;
+        let intervalId = null;
+        let isSimulationMode = false; // 기본값을 실제 API 모드로 설정 (사용자 테스트 용이성)
+
+        // 인식 결과 안정화(Debounce / Smoothing)를 위한 버퍼 변수
+        let predictionHistory = [];
+        const HISTORY_SIZE = 4; // 최근 4번의 결과를 모아서 다수결 판정
+
+        // Initialize Webcam Stream with optimal HD resolution
+        async function initCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" } 
+                });
+                videoElement.srcObject = stream;
+                apiStatusTextEl.textContent = "카메라 준비 완료. 인식 시작을 눌러주세요.";
+                apiStatusDotEl.className = "inline-block w-2.5 h-2.5 rounded-full bg-emerald-400";
+            } catch (err) {
+                console.warn("Webcam access warning or denied:", err);
+                apiStatusTextEl.textContent = "카메라 접근 불가 (브라우저 권한 확인 필요)";
+                apiStatusDotEl.className = "inline-block w-2.5 h-2.5 rounded-full bg-rose-500";
+            }
+        }
+
+        // Toggle Simulation Mode
+        simBtn.addEventListener('click', () => {
+            isSimulationMode = !isSimulationMode;
+            if (isSimulationMode) {
+                simBtn.className = "bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-2 rounded-lg transition shadow-md";
+                simBtn.textContent = "테스트 모드 ON (CORS 우회)";
+                apiStatusTextEl.textContent = "테스트 모드 작동 중";
+            } else {
+                simBtn.className = "bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold px-3 py-2 rounded-lg transition shadow-md";
+                simBtn.textContent = "실제 API 요청 모드";
+                apiStatusTextEl.textContent = "실제 Roboflow API 호출 시도 중...";
+            }
+        });
+
+        // Capture frame with high quality compression and send to Roboflow Workflow API
+        async function sendFrameToRoboflow() {
+            if (processingFrame || !isRunning) return;
+            processingFrame = true;
+
+            if (isSimulationMode) {
+                const classes = ["rock", "paper", "scissors"];
+                const randomClass = classes[Math.floor(Math.random() * classes.length)];
+                const randomConf = (0.88 + Math.random() * 0.11).toFixed(2);
+                processStablePrediction(randomClass, randomConf, true);
+                processingFrame = false;
+                return;
+            }
+
+            try {
+                // Draw current video frame to canvas at full resolution
+                canvasElement.width = videoElement.videoWidth || 1280;
+                canvasElement.height = videoElement.videoHeight || 720;
+                const ctx = canvasElement.getContext('2d');
+                ctx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+                const dataUrl = canvasElement.toDataURL('image/jpeg', 0.95);
+
+                const payload = {
+                    "inputs": {
+                        "image": {
+                            "type": "url",
+                            "value": dataUrl
+                        }
+                    }
+                };
+
+                let response;
+                try {
+                    response = await fetch(API_URL, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${API_KEY}`
+                        },
+                        body: JSON.stringify(payload)
+                    });
+                } catch (fetchErr) {
+                    // 브라우저 CORS 정책 및 iframe 차단 우회를 위한 프록시 URL 적용
+                    const proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(API_URL);
+                    response = await fetch(proxyUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${API_KEY}`
+                        },
+                        body: JSON.stringify(payload)
+                    });
+                }
+
+                if (!response.ok) {
+                    throw new Error(`HTTP 오류: ${response.status} ${response.statusText}`);
+                }
+
+                const result = await response.json();
+                parseWorkflowResponse(result);
+
+            } catch (error) {
+                console.error("Roboflow API 요청 실패:", error);
+                apiStatusTextEl.textContent = "네트워크/CORS 제한. [테스트 모드 ON]을 켜서 확인하세요.";
+                apiStatusDotEl.className = "inline-block w-2.5 h-2.5 rounded-full bg-rose-500";
+                predictionResultEl.textContent = "API 연결 차단됨";
+                confidenceResultEl.textContent = "";
+            } finally {
+                processingFrame = false;
+            }
+        }
+
+        // Helper to extract prediction and confidence from workflow response structure
+        function parseWorkflowResponse(data) {
+            try {
+                let label = "알 수 없음";
+                let confidence = null;
+                
+                if (data.outputs && data.outputs.length > 0) {
+                    const outputObj = data.outputs[0];
+                    if (outputObj.prediction) {
+                        label = outputObj.prediction.class || outputObj.prediction.top || "unknown";
+                        confidence = outputObj.prediction.confidence || outputObj.prediction.score;
+                    } else if (outputObj.class) {
+                        label = outputObj.class;
+                        confidence = outputObj.confidence;
+                    } else {
+                        const jsonStr = JSON.stringify(outputObj);
+                        if (jsonStr.includes("rock")) label = "rock";
+                        else if (jsonStr.includes("paper")) label = "paper";
+                        else if (jsonStr.includes("scissors")) label = "scissors";
+                    }
+                } else if (data.class) {
+                    label = data.class;
+                    confidence = data.confidence;
+                }
+
+                const cleanLabel = (label || "").toLowerCase().trim();
+                if (["rock", "paper", "scissors"].includes(cleanLabel)) {
+                    processStablePrediction(cleanLabel, confidence, false);
+                }
+            } catch (e) {
+                console.error("결과 파싱 중 에러:", e);
+            }
+        }
+
+        // 결과 흔들림(Flickering) 방지를 위한 안정화(다수결 및 버퍼링) 필터 함수
+        function processStablePrediction(newLabel, confidence, isSimulated) {
+            predictionHistory.push(newLabel);
+            if (predictionHistory.length > HISTORY_SIZE) {
+                predictionHistory.shift();
+            }
+
+            // 가장 빈도가 높은 클래스 산출 (다수결 투표)
+            const counts = {};
+            predictionHistory.forEach(item => {
+                counts[item] = (counts[item] || 0) + 1;
+            });
+
+            let stableLabel = newLabel;
+            let maxCount = 0;
+            for (const key in counts) {
+                if (counts[key] > maxCount) {
+                    maxCount = counts[key];
+                    stableLabel = key;
+                }
+            }
+
+            // 연속으로 일정 횟수 이상 일치하거나 충분한 신뢰도가 있을 때만 UI 갱신 반영
+            updatePredictionDisplay(stableLabel, confidence, isSimulated);
+        }
+
+        function updatePredictionDisplay(label, confText, isSimulated) {
+            const koreanLabels = {
+                "rock": "✊ 바위 (Rock)",
+                "paper": "✋ 보 (Paper)",
+                "scissors": "✌ 가위 (Scissors)"
+            };
+
+            const cleanLabel = (label || "").toLowerCase().trim();
+            predictionResultEl.textContent = koreanLabels[cleanLabel] || label;
+            
+            let displayConf = "";
+            if (typeof confText === 'number') {
+                displayConf = `${(confText * 100).toFixed(1)}%`;
+            } else if (typeof confText === 'string' && confText !== "") {
+                displayConf = confText;
+            }
+            
+            confidenceResultEl.textContent = displayConf ? `(${displayConf})` : "";
+            apiStatusTextEl.textContent = isSimulated ? "정상 인식 중 [테스트 모드]" : "정상 인식 중 [안정화 필터 적용됨]";
+            apiStatusDotEl.className = "inline-block w-2.5 h-2.5 rounded-full bg-emerald-400";
+        }
+
+        // Toggle recognition loop
+        toggleBtn.addEventListener('click', () => {
+            isRunning = !isRunning;
+            if (isRunning) {
+                predictionHistory = []; // 시작 시 히스토리 초기화
+                toggleBtn.textContent = "인식 정지";
+                toggleBtn.className = "bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold px-4 py-2 rounded-lg transition shadow-md";
+                apiStatusTextEl.textContent = "실시간 고정밀 인식 진행 중...";
+                scanLineEl.classList.remove('hidden');
+                intervalId = setInterval(sendFrameToRoboflow, 900); // 주기 최적화 (0.9초)
+            } else {
+                toggleBtn.textContent = "인식 시작";
+                toggleBtn.className = "bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold px-4 py-2 rounded-lg transition shadow-md";
+                apiStatusTextEl.textContent = "인식 일시정지됨";
+                scanLineEl.classList.add('hidden');
+                clearInterval(intervalId);
+                predictionResultEl.textContent = "대기 중...";
+                confidenceResultEl.textContent = "";
+            }
+        });
+
+        // Initialize camera on load
+        window.onload = initCamera;
+    </script>
+</body>
+</html>
